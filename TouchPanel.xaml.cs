@@ -18,18 +18,26 @@ public partial class TouchPanel : Window
     internal Action<TouchValue>? onRelease;
     internal Action? onInitialReposition;
 
-    private readonly Dictionary<int, (Polygon polygon, Point lastPoint)> activeTouches = new();
+    private readonly Dictionary<int, TouchInfo> activeTouches = new();
     private readonly TouchPanelPositionManager _positionManager;
     private List<Polygon> buttons = [];
     private bool isDebugEnabled = Properties.Settings.Default.IsDebugEnabled;
     private bool isRingButtonEmulationEnabled = Properties.Settings.Default.IsRingButtonEmulationEnabled;
     private bool hasRepositioned = false;
+    
+    private readonly Dictionary<int, Ellipse> touchVisuals = new();
+    private const double touchRadius = 28.0;
 
     private enum ResizeDirection
     {
         BottomRight = 8,
     }
 
+    struct TouchInfo
+    {
+        public List<Polygon> Polygons;
+        public Point LastPoint;
+    }
 
     [DllImport("user32.dll", CharSet = CharSet.Auto)]
     private static extern bool ReleaseCapture();
@@ -174,6 +182,27 @@ public partial class TouchPanel : Window
         SendMessage(new WindowInteropHelper(this).Handle, 0x112, (IntPtr)(0xF000 + (int)edge), IntPtr.Zero);
     }
 
+    List<Polygon> GetPolygonsInArea(Point center, double radius)
+    {
+        var polygons = new List<Polygon>();
+        var rect = new Rect(center.X - radius, center.Y - radius, 2 * radius, 2 * radius);
+        var geometry = new EllipseGeometry(rect);
+
+        VisualTreeHelper.HitTest(this,
+            null,
+            result =>
+            {
+                if (result.VisualHit is Polygon poly && !polygons.Contains(poly))
+                {
+                    polygons.Add(poly);
+                }
+                return HitTestResultBehavior.Continue;
+            },
+            new GeometryHitTestParameters(geometry));
+
+        return polygons;
+    }
+
     private void OnTouchFrameReported(object sender, TouchFrameEventArgs e)
     {
         var currentTouchPoints = e.GetTouchPoints(this);
@@ -188,13 +217,14 @@ public partial class TouchPanel : Window
             {
                 if (activeTouches.TryGetValue(id, out var touchInfo2))
                 {
-                    if (activeTouches.Values.Count(v => v.polygon == touchInfo2.polygon) == 1)
+                    foreach (var poly in touchInfo2.Polygons)
                     {
-                        HighlightElement(touchInfo2.polygon, false);
-                        onRelease?.Invoke((TouchValue)touchInfo2.polygon.Tag);
-                        if (isRingButtonEmulationEnabled)
+                        if (activeTouches.Values.Count(v => v.Polygons.Contains(poly)) == 1)
                         {
-                            RingButtonEmulator.ReleaseButton((TouchValue)touchInfo2.polygon.Tag);
+                            HighlightElement(poly, false);
+                            onRelease?.Invoke((TouchValue)poly.Tag);
+                            if (isRingButtonEmulationEnabled)
+                                RingButtonEmulator.ReleaseButton((TouchValue)poly.Tag);
                         }
                     }
                     activeTouches.Remove(id);
@@ -207,21 +237,25 @@ public partial class TouchPanel : Window
             // New touch (TouchDown)
             if (!activeTouches.TryGetValue(id, out var touchInfo))
             {
-                if (VisualTreeHelper.HitTest(this, touch.Position)?.VisualHit is Polygon polygon)
+                var polygons = GetPolygonsInArea(touch.Position, touchRadius);
+                if (polygons.Count > 0)
                 {
-                    HighlightElement(polygon, true);
-                    activeTouches[id] = (polygon, touch.Position);
-                    onTouch?.Invoke((TouchValue)polygon.Tag);
-                    if (isRingButtonEmulationEnabled && RingButtonEmulator.HasRingButtonMapping((TouchValue)polygon.Tag))
+                    foreach (var poly in polygons)
                     {
-                        RingButtonEmulator.PressButton((TouchValue)polygon.Tag);
+                        HighlightElement(poly, true);
+                        onTouch?.Invoke((TouchValue)poly.Tag);
+                        if (isRingButtonEmulationEnabled && RingButtonEmulator.HasRingButtonMapping((TouchValue)poly.Tag))
+                        {
+                            RingButtonEmulator.PressButton((TouchValue)poly.Tag);
+                        }
                     }
+                    activeTouches[id] = new TouchInfo { Polygons = polygons, LastPoint = touch.Position };
                 }
             }
             // Existing touch (TouchMove)
             else
             {
-                var previousPosition = touchInfo.lastPoint;
+                var previousPosition = touchInfo.LastPoint;
                 var currentPosition = touch.Position;
                 var sampleCount = 10;
                 var changed = false;
@@ -232,23 +266,45 @@ public partial class TouchPanel : Window
                     var samplePoint = new Point(
                         previousPosition.X + (currentPosition.X - previousPosition.X) * t,
                         previousPosition.Y + (currentPosition.Y - previousPosition.Y) * t);
-                    if (VisualTreeHelper.HitTest(this, samplePoint)?.VisualHit is Polygon polygon && polygon != touchInfo.polygon)
+
+                    var newPolygons = GetPolygonsInArea(samplePoint, touchRadius);
+                    var oldPolygons = touchInfo.Polygons;
+
+                    // Check for any change
+                    bool polygonsChanged = !newPolygons.SequenceEqual(oldPolygons);
+
+                    if (polygonsChanged)
                     {
-                        if (activeTouches.Values.Count(v => v.polygon == touchInfo.polygon) == 1)
+                        // Unhighlight and release old polygons
+                        foreach (var poly in oldPolygons)
                         {
-                            HighlightElement(touchInfo.polygon, false);
-                            onRelease?.Invoke((TouchValue)touchInfo.polygon.Tag);
+                            if (activeTouches.Values.Count(v => v.Polygons.Contains(poly)) == 1)
+                            {
+                                HighlightElement(poly, false);
+                                onRelease?.Invoke((TouchValue)poly.Tag);
+                                if (isRingButtonEmulationEnabled)
+                                    RingButtonEmulator.ReleaseButton((TouchValue)poly.Tag);
+                            }
                         }
-                        HighlightElement(polygon, true);
-                        onTouch?.Invoke((TouchValue)polygon.Tag);
-                        activeTouches[id] = (polygon, samplePoint);
+
+                        // Highlight and trigger new polygons
+                        foreach (var poly in newPolygons)
+                        {
+                            HighlightElement(poly, true);
+                            onTouch?.Invoke((TouchValue)poly.Tag);
+                            if (isRingButtonEmulationEnabled && RingButtonEmulator.HasRingButtonMapping((TouchValue)poly.Tag))
+                                RingButtonEmulator.PressButton((TouchValue)poly.Tag);
+                        }
+
+                        activeTouches[id] = new TouchInfo { Polygons = newPolygons, LastPoint = samplePoint };
                         changed = true;
                         break;
                     }
                 }
+
                 if (!changed)
                 {
-                    activeTouches[id] = (touchInfo.polygon, currentPosition);
+                    activeTouches[id] = new TouchInfo { Polygons = touchInfo.Polygons, LastPoint = currentPosition };
                 }
             }
         }
@@ -258,13 +314,15 @@ public partial class TouchPanel : Window
         foreach (var id in endedTouches)
         {
             var touchInfo = activeTouches[id];
-            if (activeTouches.Values.Count(v => v.polygon == touchInfo.polygon) == 1)
+
+            foreach (var poly in touchInfo.Polygons)
             {
-                HighlightElement(touchInfo.polygon, false);
-                onRelease?.Invoke((TouchValue)touchInfo.polygon.Tag);
-                if (isRingButtonEmulationEnabled)
+                if (activeTouches.Values.Count(v => v.Polygons.Contains(poly)) == 1)
                 {
-                    RingButtonEmulator.ReleaseButton((TouchValue)touchInfo.polygon.Tag);
+                    HighlightElement(poly, false);
+                    onRelease?.Invoke((TouchValue)poly.Tag);
+                    if (isRingButtonEmulationEnabled)
+                        RingButtonEmulator.ReleaseButton((TouchValue)poly.Tag);
                 }
             }
             activeTouches.Remove(id);
@@ -273,12 +331,16 @@ public partial class TouchPanel : Window
 
     private void DeselectAllItems()
     {
-        // Logic to deselect all items or the last touched item
+        // Deselect all active polygons
         foreach (var element in activeTouches.Values)
         {
-            HighlightElement(element.polygon, false);
-            onRelease?.Invoke((TouchValue)element.polygon.Tag);
+            foreach (var poly in element.Polygons)
+            {
+                HighlightElement(poly, false);
+                onRelease?.Invoke((TouchValue)poly.Tag);
+            }
         }
+
         activeTouches.Clear();
         RingButtonEmulator.ReleaseAllButtons();
     }
